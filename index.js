@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 app.use(cors());
@@ -32,14 +32,13 @@ Safety:
 
 const genAI = new GoogleGenerativeAI(apiKey);
 
+// تنظیمات ایمنی با رشته ساده (سازگار با نسخه جدید)
 const safetySettings = [
-  { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_HARASSMENT,          threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT,      threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+  { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' },
+  { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_MEDIUM_AND_ABOVE' }
 ];
 
-// health check
+// Health check
 app.get('/health', (_req, res) => {
   res.json({ ok: true, model: MODEL_ID });
 });
@@ -51,7 +50,6 @@ app.post('/api/doctor-chat', async (req, res) => {
 });
 
 // GET endpoint
-// مثال: /api/doctor-chat?message=سه+روزه+سرفه+دارم&stream=false
 app.get('/api/doctor-chat', async (req, res) => {
   const { message, stream } = req.query;
   let history = [];
@@ -63,16 +61,12 @@ app.get('/api/doctor-chat', async (req, res) => {
   }
 
   return handleDoctorChat(
-    { 
-      message, 
-      history, 
-      stream: stream === 'true' 
-    }, 
+    { message, history, stream: stream === 'true' },
     res
   );
 });
 
-// handler function
+// Handler مشترک
 async function handleDoctorChat({ message, history, stream }, res) {
   try {
     if (!message || typeof message !== 'string') {
@@ -86,10 +80,7 @@ async function handleDoctorChat({ message, history, stream }, res) {
 
     const chat = model.startChat({
       safetySettings,
-      history: history.map(m => ({
-        role: m.role,
-        parts: [{ text: m.parts }],
-      })),
+      history: history.map(m => ({ role: m.role, parts: [{ text: m.parts }] })),
       generationConfig: {
         temperature: 0.4,
         topK: 32,

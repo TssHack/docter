@@ -1,16 +1,77 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import compression from 'compression';
+import rateLimit from 'express-rate-limit';
+import slowDown from 'express-slow-down';
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' })); // اضافه کردن محدودیت حجم
+app.use(compression()); // فشرده‌سازی پاسخ‌ها برای افزایش سرعت
+app.use(express.json({ limit: '10mb' }));
 
-const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey) {
-  console.error('❌ GEMINI_API_KEY is missing in .env');
+// محدودیت نرخ درخواست برای جلوگیری از سوءاستفاده
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 دقیقه
+  max: 100, // حداکثر 100 درخواست در هر 15 دقیقه
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'تعداد درخواست‌های شما بیش از حد مجاز است',
+    code: 'RATE_LIMIT_EXCEEDED'
+  }
+});
+
+// کاهش سرعت برای جلوگیری از حملات
+const speedLimiter = slowDown({
+  windowMs: 15 * 60 * 1000, // 15 دقیقه
+  delayAfter: 50, // بعد از 50 درخواست شروع به کاهش سرعت کن
+  delayMs: (hits) => hits * 100, // هر درخواست اضافی 100ms تاخیر داشته باشد
+});
+
+app.use('/api/', limiter);
+app.use('/api/', speedLimiter);
+
+// سیستم مدیریت لایسنس‌های چرخشی
+const API_KEYS = process.env.GEMINI_API_KEYS ? process.env.GEMINI_API_KEYS.split(',') : [];
+if (!API_KEYS.length || !API_KEYS[0]) {
+  console.error('❌ GEMINI_API_KEYS is missing in .env');
   process.exit(1);
+}
+
+let currentApiKeyIndex = 0;
+
+function getNextApiKey() {
+  const key = API_KEYS[currentApiKeyIndex];
+  currentApiKeyIndex = (currentApiKeyIndex + 1) % API_KEYS.length;
+  return key;
+}
+
+// سیستم کش ساده برای پاسخ‌های تکراری
+const responseCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 دقیقه
+
+function getCacheKey(message, history) {
+  return JSON.stringify({ 
+    message, 
+    history: history.slice(-5) // فقط 5 پیام آخر را در نظر بگیرید
+  });
+}
+
+function getFromCache(key) {
+  const item = responseCache.get(key);
+  if (item && Date.now() - item.timestamp < CACHE_TTL) {
+    return item.data;
+  }
+  return null;
+}
+
+function setCache(key, data) {
+  responseCache.set(key, {
+    data,
+    timestamp: Date.now()
+  });
 }
 
 const MODEL_ID = process.env.MODEL_ID || 'gemini-1.5-pro';
@@ -30,15 +91,6 @@ const SYSTEM_INSTRUCTION = `
 - مراجعه حضوری به پزشک متخصص را توصیه کنید
 `;
 
-const genAI = new GoogleGenerativeAI(apiKey);
-
-const safetySettings = [
-  { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-  { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-];
-
 // middleware برای error handling
 app.use((err, req, res, next) => {
   console.error('Express Error:', err);
@@ -54,7 +106,9 @@ app.get('/health', (_req, res) => {
     ok: true, 
     model: MODEL_ID,
     timestamp: new Date().toISOString(),
-    version: '1.0.0'
+    version: '1.0.0',
+    apiKeysCount: API_KEYS.length,
+    currentApiKeyIndex: currentApiKeyIndex
   });
 });
 
@@ -122,33 +176,85 @@ async function handleDoctorChat({ message, history, stream }, res) {
       });
     }
 
+    // اعتبارسنجی هر آیتم در تاریخچه
+    for (const item of history) {
+      if (!item.role || !item.parts) {
+        return res.status(400).json({ 
+          error: 'هر آیتم در history باید role و parts داشته باشد',
+          invalidItem: item
+        });
+      }
+      
+      if (!['user', 'assistant', 'model'].includes(item.role)) {
+        return res.status(400).json({ 
+          error: 'نقش باید یکی از مقادیر user، assistant یا model باشد',
+          invalidRole: item.role
+        });
+      }
+    }
+
     // محدود کردن تاریخچه
     const limitedHistory = history.slice(-20); // فقط ۲۰ پیام آخر
+
+    // بررسی کش
+    const cacheKey = getCacheKey(message, limitedHistory);
+    const cachedResponse = getFromCache(cacheKey);
+
+    if (cachedResponse && !stream) {
+      return res.json({
+        ...cachedResponse,
+        fromCache: true,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // استفاده از لایسنس چرخشی
+    const apiKey = getNextApiKey();
+    const genAI = new GoogleGenerativeAI(apiKey);
 
     const model = genAI.getGenerativeModel({
       model: MODEL_ID,
       systemInstruction: SYSTEM_INSTRUCTION,
     });
 
-    // تبدیل فرمت تاریخچه
+    // تبدیل فرمت تاریخچه با مدیریت بهتر
     const formattedHistory = limitedHistory.map(m => {
-      if (!m.role || !m.parts) {
-        throw new Error('هر آیتم در history باید role و parts داشته باشد');
+      let textContent = '';
+      if (typeof m.parts === 'string') {
+        textContent = m.parts;
+      } else if (Array.isArray(m.parts)) {
+        textContent = m.parts.map(part => {
+          if (typeof part === 'string') return part;
+          if (part && part.text) return part.text;
+          return JSON.stringify(part);
+        }).join('');
+      } else if (m.parts && m.parts.text) {
+        textContent = m.parts.text;
+      } else {
+        textContent = JSON.stringify(m.parts);
       }
+      
       return {
-        role: m.role === 'assistant' ? 'model' : m.role, // تبدیل assistant به model
-        parts: [{ text: typeof m.parts === 'string' ? m.parts : JSON.stringify(m.parts) }],
+        role: m.role === 'assistant' ? 'model' : m.role,
+        parts: [{ text: textContent }],
       };
     });
+
+    const safetySettings = [
+      { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+      { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+      { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+      { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+    ];
 
     const chat = model.startChat({
       safetySettings,
       history: formattedHistory,
       generationConfig: {
-        temperature: 0.3, // کمی کاهش برای پاسخ‌های پزشکی دقیق‌تر
+        temperature: 0.3,
         topK: 40,
         topP: 0.8,
-        maxOutputTokens: 2048, // افزایش برای پاسخ‌های کاملتر
+        maxOutputTokens: 2048,
         responseMimeType: 'text/plain',
       },
     });
@@ -180,8 +286,16 @@ async function handleDoctorChat({ message, history, stream }, res) {
         
         return res.end();
       } catch (streamError) {
-        res.write(`خطا در پردازش: ${streamError.message}`);
-        return res.end();
+        console.error('Stream Error:', streamError);
+        if (!res.headersSent) {
+          res.status(500).json({ 
+            error: 'خطا در پردازش درخواست',
+            message: streamError.message 
+          });
+        } else {
+          res.write(`\n\nخطا در پردازش: ${streamError.message}`);
+          return res.end();
+        }
       }
     } else {
       // پردازش معمولی
@@ -196,37 +310,50 @@ async function handleDoctorChat({ message, history, stream }, res) {
         });
       }
 
-      return res.json({
+      const responseData = {
         reply: text,
         nextHistoryItem: { role: 'model', parts: text },
         safety: response.candidates?.[0]?.safetyRatings || null,
         timestamp: new Date().toISOString(),
         model: MODEL_ID,
         tokensUsed: response.usageMetadata || null
-      });
+      };
+
+      // ذخیره در کش
+      setCache(cacheKey, responseData);
+
+      return res.json(responseData);
     }
   } catch (err) {
     console.error('خطا در handleDoctorChat:', err);
     
     // بررسی انواع خطاهای مختلف
-    if (err.message?.includes('API_KEY')) {
+    if (err.message?.includes('API_KEY') || err.message?.includes('API key')) {
       return res.status(401).json({ 
         error: 'مشکل در کلید API',
         code: 'API_KEY_ERROR'
       });
     }
     
-    if (err.message?.includes('quota')) {
+    if (err.message?.includes('quota') || err.message?.includes('QUOTA_EXCEEDED')) {
       return res.status(429).json({ 
         error: 'محدودیت استفاده از API',
         code: 'QUOTA_EXCEEDED'
       });
     }
     
-    if (err.message?.includes('safety')) {
+    if (err.message?.includes('safety') || err.message?.includes('SAFETY')) {
       return res.status(400).json({ 
         error: 'پیام شما شامل محتوای نامناسب است',
         code: 'SAFETY_FILTER'
+      });
+    }
+
+    if (err.message?.includes('400')) {
+      return res.status(400).json({ 
+        error: 'درخواست نامعتبر',
+        code: 'BAD_REQUEST',
+        message: err.message
       });
     }
 
@@ -241,6 +368,8 @@ async function handleDoctorChat({ message, history, stream }, res) {
 // endpoint برای دریافت لیست مدل‌های موجود
 app.get('/api/models', async (_req, res) => {
   try {
+    const apiKey = getNextApiKey();
+    const genAI = new GoogleGenerativeAI(apiKey);
     const models = await genAI.listModels();
     res.json({
       currentModel: MODEL_ID,
@@ -258,12 +387,78 @@ app.get('/api/models', async (_req, res) => {
   }
 });
 
+// endpoint برای مدیریت لایسنس‌ها
+// افزودن لایسنس جدید
+app.post('/api/licenses', (req, res) => {
+  const { key } = req.body;
+  
+  if (!key || typeof key !== 'string') {
+    return res.status(400).json({ 
+      error: 'کلید (string) الزامی است',
+      received: typeof key
+    });
+  }
+  
+  if (API_KEYS.includes(key)) {
+    return res.status(400).json({ 
+      error: 'این کلید از قبل وجود دارد'
+    });
+  }
+  
+  API_KEYS.push(key);
+  
+  res.json({
+    success: true,
+    message: 'کلید با موفقیت اضافه شد',
+    totalKeys: API_KEYS.length
+  });
+});
+
+// حذف لایسنس
+app.delete('/api/licenses/:key', (req, res) => {
+  const { key } = req.params;
+  
+  const index = API_KEYS.indexOf(key);
+  if (index === -1) {
+    return res.status(404).json({ 
+      error: 'کلید مورد نظر یافت نشد'
+    });
+  }
+  
+  API_KEYS.splice(index, 1);
+  
+  // اگر کلید حذف شده همان کلید فعلی بود، ایندکس را تنظیم مجدد کن
+  if (currentApiKeyIndex >= API_KEYS.length) {
+    currentApiKeyIndex = 0;
+  }
+  
+  res.json({
+    success: true,
+    message: 'کلید با موفقیت حذف شد',
+    totalKeys: API_KEYS.length
+  });
+});
+
+// دریافت لیست لایسنس‌ها
+app.get('/api/licenses', (_req, res) => {
+  res.json({
+    totalKeys: API_KEYS.length,
+    currentKeyIndex: currentApiKeyIndex,
+    keys: API_KEYS.map((key, index) => ({
+      index,
+      key: key.substring(0, 8) + '...', // فقط بخشی از کلید را نمایش بده
+      isCurrent: index === currentApiKeyIndex
+    }))
+  });
+});
+
 // راه‌اندازی سرور
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => {
   console.log(`🚀 Doctor Chat API در حال اجرا: http://localhost:${port}`);
   console.log(`📊 Health check: http://localhost:${port}/health`);
   console.log(`🤖 مدل فعلی: ${MODEL_ID}`);
+  console.log(`🔑 تعداد کلیدهای API: ${API_KEYS.length}`);
 });
 
 // Graceful shutdown

@@ -1,4 +1,3 @@
-```js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -133,4 +132,4 @@ process.on('SIGINT', () => {
 });
 
 export default app;
-```
+

@@ -49,8 +49,8 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, model: MODEL_ID, ts: Date.now(), cacheSize: cache.size });
 });
 
-// چت سریع با کش
-app.post('/api/chat', async (req, res) => {
+// تابع اصلی چت
+async function handleChat(req, res) {
   try {
     const { message } = req.body || {};
     if (!message) return res.status(400).json({ error: 'message الزامی است' });
@@ -75,7 +75,13 @@ app.post('/api/chat', async (req, res) => {
     console.error(err);
     res.status(500).json({ error: 'خطا در پردازش', msg: err.message });
   }
-});
+}
+
+// مسیر جدید
+app.post('/api/chat', handleChat);
+
+// مسیر قدیمی برای هماهنگی
+app.post('/api/doctor-chat', handleChat);
 
 // start
 const port = process.env.PORT || 3000;

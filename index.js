@@ -1,3 +1,4 @@
+```js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -11,7 +12,7 @@ app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: '5mb' }));
 
-// API Keys
+// API Keys (چرخشی)
 const API_KEYS = process.env.GEMINI_API_KEYS?.split(',') || [];
 if (!API_KEYS.length) {
   console.error('❌ GEMINI_API_KEYS لازم است');
@@ -24,7 +25,7 @@ function getNextApiKey() {
   return key;
 }
 
-// مدل سریع
+// مدل
 const MODEL_ID = process.env.MODEL_ID || 'gemini-1.5-flash';
 
 // کش ساده
@@ -46,19 +47,36 @@ function setCache(key, data) {
 
 // health check
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, model: MODEL_ID, ts: Date.now(), cacheSize: cache.size });
+  res.json({
+    ok: true,
+    model: MODEL_ID,
+    timestamp: new Date().toISOString(),
+    cacheSize: cache.size,
+    apiKeysCount: API_KEYS.length,
+    currentApiKeyIndex
+  });
 });
 
 // تابع اصلی چت
 async function handleChat(req, res) {
   try {
     const { message } = req.body || {};
-    if (!message) return res.status(400).json({ error: 'message الزامی است' });
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'message الزامی است', received: typeof message });
+    }
+
+    if (message.length > 5000) {
+      return res.status(400).json({ error: 'پیام بیش از حد طولانی است', length: message.length });
+    }
 
     const cacheKey = getCacheKey(message);
     const cached = getFromCache(cacheKey);
     if (cached) {
-      return res.json({ reply: cached, fromCache: true });
+      return res.json({
+        ...cached,
+        fromCache: true,
+        timestamp: new Date().toISOString()
+      });
     }
 
     const apiKey = getNextApiKey();
@@ -68,23 +86,51 @@ async function handleChat(req, res) {
     const result = await model.generateContent(message);
     const text = result.response.text() || '';
 
-    setCache(cacheKey, text);
+    if (!text.trim()) {
+      return res.status(500).json({ error: 'پاسخ خالی از مدل دریافت شد' });
+    }
 
-    res.json({ reply: text, fromCache: false });
+    const responseData = {
+      reply: text,
+      nextHistoryItem: { role: 'model', parts: text },
+      timestamp: new Date().toISOString(),
+      model: MODEL_ID
+    };
+
+    setCache(cacheKey, responseData);
+
+    res.json({ ...responseData, fromCache: false });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'خطا در پردازش', msg: err.message });
+    console.error('❌ Chat Error:', err);
+    res.status(500).json({
+      error: 'خطا در پردازش',
+      message: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
   }
 }
 
-// مسیر جدید
+// مسیرها (سازگار با نسخه قبلی)
 app.post('/api/chat', handleChat);
-
-// مسیر قدیمی برای هماهنگی
 app.post('/api/doctor-chat', handleChat);
 
 // start
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`🚀 Server at http://localhost:${port}`);
+const server = app.listen(port, () => {
+  console.log(`🚀 Chat API در حال اجرا: http://localhost:${port}`);
+  console.log(`📊 Health check: http://localhost:${port}/health`);
+  console.log(`🤖 مدل فعلی: ${MODEL_ID}`);
+  console.log(`🔑 تعداد کلیدهای API: ${API_KEYS.length}`);
 });
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('📥 SIGTERM دریافت شد، در حال خاموش کردن سرور...');
+  server.close(() => console.log('✅ سرور خاموش شد'));
+});
+process.on('SIGINT', () => {
+  console.log('📥 SIGINT دریافت شد، در حال خاموش کردن سرور...');
+  server.close(() => console.log('✅ سرور خاموش شد'));
+});
+
+export default app;
+```

@@ -57,60 +57,63 @@ app.get('/health', (_req, res) => {
 });
 
 // تابع اصلی چت
-async function handleChat(req, res) {
-  try {
-    const { message } = req.body || {};
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ error: 'message الزامی است', received: typeof message });
-    }
-
-    if (message.length > 5000) {
-      return res.status(400).json({ error: 'پیام بیش از حد طولانی است', length: message.length });
-    }
-
-    const cacheKey = getCacheKey(message);
-    const cached = getFromCache(cacheKey);
-    if (cached) {
-      return res.json({
-        ...cached,
-        fromCache: true,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    const apiKey = getNextApiKey();
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: MODEL_ID });
-
-    const result = await model.generateContent(message);
-    const text = result.response.text() || '';
-
-    if (!text.trim()) {
-      return res.status(500).json({ error: 'پاسخ خالی از مدل دریافت شد' });
-    }
-
-    const responseData = {
-      reply: text,
-      nextHistoryItem: { role: 'model', parts: text },
-      timestamp: new Date().toISOString(),
-      model: MODEL_ID
-    };
-
-    setCache(cacheKey, responseData);
-
-    res.json({ ...responseData, fromCache: false });
-  } catch (err) {
-    console.error('❌ Chat Error:', err);
-    res.status(500).json({
-      error: 'خطا در پردازش',
-      message: process.env.NODE_ENV === 'development' ? err.message : undefined
-    });
+async function handleChatMessage(message) {
+  if (!message || typeof message !== 'string') {
+    throw new Error('message الزامی است');
   }
+  if (message.length > 5000) {
+    throw new Error('پیام بیش از حد طولانی است');
+  }
+
+  const cacheKey = getCacheKey(message);
+  const cached = getFromCache(cacheKey);
+  if (cached) {
+    return { ...cached, fromCache: true, timestamp: new Date().toISOString() };
+  }
+
+  const apiKey = getNextApiKey();
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: MODEL_ID });
+
+  const result = await model.generateContent(message);
+  const text = result.response.text() || '';
+  if (!text.trim()) {
+    throw new Error('پاسخ خالی از مدل دریافت شد');
+  }
+
+  const responseData = {
+    reply: text,
+    nextHistoryItem: { role: 'model', parts: text },
+    timestamp: new Date().toISOString(),
+    model: MODEL_ID
+  };
+  setCache(cacheKey, responseData);
+
+  return { ...responseData, fromCache: false };
 }
 
-// مسیرها (سازگار با نسخه قبلی)
-app.post('/api/chat', handleChat);
-app.post('/api/doctor-chat', handleChat);
+// POST endpoint (اصلی)
+app.post(['/api/chat', '/api/doctor-chat'], async (req, res) => {
+  try {
+    const { message } = req.body || {};
+    const responseData = await handleChatMessage(message);
+    res.json(responseData);
+  } catch (err) {
+    console.error('❌ Chat Error:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// GET endpoint (برای تست مرورگر)
+app.get('/api/doctor-chat', async (req, res) => {
+  try {
+    const message = req.query.message || 'سلام 👋';
+    const responseData = await handleChatMessage(message);
+    res.json(responseData);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
 
 // start
 const port = process.env.PORT || 3000;
@@ -132,4 +135,3 @@ process.on('SIGINT', () => {
 });
 
 export default app;
-
